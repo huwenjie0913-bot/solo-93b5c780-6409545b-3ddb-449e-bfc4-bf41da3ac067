@@ -8,10 +8,11 @@ from .barcode_engine import encode_modules, runs_from_bits
 from .errors import CannotFitError
 from .geometry import (
     aabb_gap,
-    aabb_intersects,
     dots_to_mm,
     mm_to_dots,
+    polygons_intersect,
     rotated_bbox,
+    rotated_corners,
 )
 from .schemas import LabelSpec, LayoutSpec, PrinterSpec
 
@@ -216,17 +217,30 @@ def analyze_layout(
     qz_side = min(qz_dists, key=qz_dists.get)
     qz_edge = qz_dists[qz_side]
 
-    # 障碍物（文字块）侵入静区检测
+    # 障碍物（文字块）侵入静区检测：一律用旋转后的真实矩形角点做精确相交
+    box_corners = rotated_corners(
+        cx, cy, box.width_mm, box.height_mm, box.rotation_deg
+    )
+    ex_corners = rotated_corners(
+        cx, cy, box.width_mm + 2 * qz_req, box.height_mm, box.rotation_deg
+    )
     obstacles = []
     for t in layout.texts:
         tcx, tcy = t.x_mm + t.width_mm / 2, t.y_mm + t.height_mm / 2
-        tb = rotated_bbox(tcx, tcy, t.width_mm, t.height_mm, t.rotation_deg)
-        obstacles.append((t.id or t.content[:12], tb, "text"))
+        corners = rotated_corners(tcx, tcy, t.width_mm, t.height_mm, t.rotation_deg)
+        obstacles.append((t.id or t.content[:12], corners, "text"))
     for z in layout.forbidden_zones:
-        obstacles.append((z.id or "zone", (z.x_mm, z.y_mm,
-                          z.x_mm + z.width_mm, z.y_mm + z.height_mm), "forbidden"))
+        zc = [
+            (z.x_mm, z.y_mm),
+            (z.x_mm + z.width_mm, z.y_mm),
+            (z.x_mm + z.width_mm, z.y_mm + z.height_mm),
+            (z.x_mm, z.y_mm + z.height_mm),
+        ]
+        obstacles.append((z.id or "zone", zc, "forbidden"))
 
-    intrusions = [name for name, ob, _ in obstacles if aabb_intersects(ex_bb, ob)]
+    intrusions = [
+        name for name, oc, _ in obstacles if polygons_intersect(ex_corners, oc)
+    ]
     if qz_edge < 0 or intrusions:
         st = "fail"
     elif qz_edge < qz_req * (SAFETY_RATIO - 1):
@@ -259,14 +273,19 @@ def analyze_layout(
             }
         )
 
-    # ---- 7. 裁切禁区碰撞 ---------------------------------------------------
+    # ---- 7. 裁切禁区碰撞（按旋转后的真实条码实体，而非 AABB） --------------
     hits = []
     qz_zone_hits = []
     for z in layout.forbidden_zones:
-        zb = (z.x_mm, z.y_mm, z.x_mm + z.width_mm, z.y_mm + z.height_mm)
-        if aabb_intersects(bb, zb):
+        zc = [
+            (z.x_mm, z.y_mm),
+            (z.x_mm + z.width_mm, z.y_mm),
+            (z.x_mm + z.width_mm, z.y_mm + z.height_mm),
+            (z.x_mm, z.y_mm + z.height_mm),
+        ]
+        if polygons_intersect(box_corners, zc):
             hits.append(z.id or "zone")
-        elif aabb_intersects(ex_bb, zb):
+        elif polygons_intersect(ex_corners, zc):
             qz_zone_hits.append(z.id or "zone")
     if hits:
         st, margin = "fail", 0.0
@@ -303,10 +322,10 @@ def analyze_layout(
             }
         )
 
-    # ---- 8. 文字碰撞 -------------------------------------------------------
+    # ---- 8. 文字碰撞（精确旋转矩形相交） -----------------------------------
     text_hits = [
-        name for name, ob, kind in obstacles
-        if kind == "text" and aabb_intersects(bb, ob)
+        name for name, oc, kind in obstacles
+        if kind == "text" and polygons_intersect(box_corners, oc)
     ]
     add(
         "text_collision",

@@ -19,14 +19,16 @@ def render_preview(
     layout: LayoutSpec,
     analysis: dict,
 ) -> str:
-    scale = printer.dpi / 25.4  # 点/mm
-    w_px = max(1, round(label.width_mm * scale))
-    h_px = max(1, round(label.height_mm * scale))
+    printer_scale = printer.dpi / 25.4  # 打印点/mm
+    shrink = 1.0
+    w_px = max(1, round(label.width_mm * printer_scale))
+    h_px = max(1, round(label.height_mm * printer_scale))
     if w_px * h_px > MAX_PIXELS:
         shrink = (MAX_PIXELS / (w_px * h_px)) ** 0.5
-        scale *= shrink
-        w_px = max(1, round(label.width_mm * scale))
-        h_px = max(1, round(label.height_mm * scale))
+    # 背景、目标框、条纹共用同一缩放比例
+    scale = printer_scale * shrink
+    w_px = max(1, round(label.width_mm * scale))
+    h_px = max(1, round(label.height_mm * scale))
 
     img = Image.new("RGB", (w_px, h_px), "white")
     draw = ImageDraw.Draw(img, "RGBA")
@@ -65,11 +67,11 @@ def render_preview(
             draw.text((t.x_mm * scale + 2, t.y_mm * scale + 2),
                       t.content[:24], fill=(90, 90, 90), font=font)
 
-    # 条码条纹：先在本地图层按真实点阵绘制，再旋转贴入
+    # 条码条纹：先按打印机原始分辨率绘制真实点阵，旋转后统一收缩到预览比例
     raster = rd["raster"]
     box = layout.barcode.box
     total_dots = raster[-1]["start_dot"] + raster[-1]["dots"] if raster else 1
-    bar_h = max(1, round(box.height_mm * scale))
+    bar_h = max(1, round(box.height_mm * printer_scale))
     overlay = Image.new("RGBA", (max(1, total_dots), bar_h), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
     min_dots = min(r["dots"] for r in raster if r["is_bar"] and r["dots"] > 0)
@@ -88,6 +90,12 @@ def render_preview(
         # PIL 逆时针为正；本系统顺时针为正
         overlay = overlay.rotate(-angle, expand=True, resample=Image.NEAREST,
                                  fillcolor=(0, 0, 0, 0))
+    if shrink != 1.0:
+        overlay = overlay.resize(
+            (max(1, round(overlay.width * shrink)),
+             max(1, round(overlay.height * shrink))),
+            resample=Image.NEAREST,
+        )
     bb = rd["bbox"]
     img.paste(overlay, (round(bb[0] * scale), round(bb[1] * scale)), overlay)
 

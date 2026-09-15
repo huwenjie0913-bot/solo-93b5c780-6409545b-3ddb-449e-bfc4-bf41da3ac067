@@ -1,6 +1,8 @@
 import base64
+import io
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app.main import app
 
@@ -158,3 +160,60 @@ def test_300dpi_more_dots():
     }).json()["results"][0]
     assert (r300["barcode"]["module_width_dots_ideal"]
             > res203["barcode"]["module_width_dots_ideal"])
+
+
+def test_rotated_entity_not_aabb_for_forbidden_zone():
+    """40x10mm 条码旋转 45°：AABB 角上、实体外的 corner 禁区不算碰撞。"""
+    # 实体角点 (39.39,7.32)-(32.32,14.39) 连线为 x+y=46.71；
+    # corner 禁区 x+y 最大 46.0，在实体外、AABB(32.32..67.68, 7.32..42.68) 内
+    corner = layout(
+        quiet_zone_mm=0,
+        barcode={
+            "symbology": "code128", "data": "ABC123",
+            "box": {"x_mm": 30, "y_mm": 20, "width_mm": 40, "height_mm": 10,
+                    "rotation_deg": 45},
+        },
+        forbidden_zones=[{"id": "corner", "x_mm": 32.5, "y_mm": 7.5,
+                          "width_mm": 3, "height_mm": 3}],
+    )
+    res = post([corner]).json()["results"][0]
+    fz = next(c for c in res["checks"] if c["check"] == "forbidden_zone")
+    assert fz["status"] == "pass", fz["detail"]
+    assert not any(r["code"] == "FORBIDDEN_ZONE" for r in res["risks"])
+
+    # 对照：真正压住旋转实体的禁区仍判 fail
+    hit = layout(
+        quiet_zone_mm=0,
+        barcode={
+            "symbology": "code128", "data": "ABC123",
+            "box": {"x_mm": 30, "y_mm": 20, "width_mm": 40, "height_mm": 10,
+                    "rotation_deg": 45},
+        },
+        forbidden_zones=[{"id": "center", "x_mm": 48, "y_mm": 23,
+                          "width_mm": 4, "height_mm": 4}],
+    )
+    res2 = post([hit]).json()["results"][0]
+    fz2 = next(c for c in res2["checks"] if c["check"] == "forbidden_zone")
+    assert fz2["status"] == "fail"
+    assert fz2["element"]["zone_ids"] == ["center"]
+
+
+def test_preview_shrink_uses_uniform_scale():
+    """300mm/300DPI 缩略到 2000px 时，条纹与目标框共用同一缩放比例。"""
+    req = {
+        "label": {"width_mm": 300, "height_mm": 300},
+        "printer": {"dpi": 300},
+        "layouts": [layout(barcode={
+            "symbology": "code128", "data": "ABC123",
+            "box": {"x_mm": 10, "y_mm": 10, "width_mm": 50, "height_mm": 10},
+        })],
+    }
+    res = client.post("/v1/preflight", json=req).json()["results"][0]
+    img = Image.open(io.BytesIO(base64.b64decode(res["preview_png_base64"])))
+    assert img.size == (2000, 2000)
+    # 框右缘 60mm -> 400px；在条码行范围内找最右深色像素
+    gray = img.convert("L").crop((50, 70, 1500, 130))
+    bbox = gray.point(lambda p: 255 if p < 100 else 0).getbbox()
+    assert bbox is not None
+    right_px = 50 + bbox[2]
+    assert 390 <= right_px <= 415, f"条纹右缘 {right_px}px，应≈400px（旧缺陷为 657）"

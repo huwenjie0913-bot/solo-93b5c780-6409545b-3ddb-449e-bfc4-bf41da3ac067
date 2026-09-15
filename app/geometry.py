@@ -37,6 +37,49 @@ def rotated_bbox(cx: float, cy: float, w: float, h: float, angle_deg: float):
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def rotated_corners(cx: float, cy: float, w: float, h: float, angle_deg: float):
+    """旋转矩形的四个角点（顺时针为正）。"""
+    corners = [
+        (cx - w / 2, cy - h / 2),
+        (cx + w / 2, cy - h / 2),
+        (cx + w / 2, cy + h / 2),
+        (cx - w / 2, cy + h / 2),
+    ]
+    return [rotate_point(x, y, cx, cy, angle_deg) for x, y in corners]
+
+
+def _edge_normals(pts):
+    axes = []
+    for i in range(len(pts)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(pts)]
+        axes.append((-(y2 - y1), x2 - x1))
+    return axes
+
+
+def polygons_intersect(a, b) -> bool:
+    """凸多边形相交判定（分离轴定理）。"""
+    for poly in (a, b):
+        for ax, ay in _edge_normals(poly):
+            proj_a = [x * ax + y * ay for x, y in a]
+            proj_b = [x * ax + y * ay for x, y in b]
+            if max(proj_a) < min(proj_b) or max(proj_b) < min(proj_a):
+                return False
+    return True
+
+
+def rotated_rect_intersects_aabb(cx, cy, w, h, angle_deg, aabb) -> bool:
+    """旋转条码实体（精确矩形）与轴对齐禁区是否相交。"""
+    corners = rotated_corners(cx, cy, w, h, angle_deg)
+    rect = [
+        (aabb[0], aabb[1]),
+        (aabb[2], aabb[1]),
+        (aabb[2], aabb[3]),
+        (aabb[0], aabb[3]),
+    ]
+    return polygons_intersect(corners, rect)
+
+
 def aabb_intersects(a, b) -> bool:
     return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
 
