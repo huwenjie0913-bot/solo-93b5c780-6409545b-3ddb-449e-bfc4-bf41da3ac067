@@ -214,17 +214,30 @@ def evaluate_printer(
         nb = min(bars, key=lambda r: r["dots_gained"])
         ns = min(inner_spaces, key=lambda r: r["dots_gained"]) if inner_spaces else None
 
-        if nb["dots_gained"] < req:
-            reason = (
-                "narrow_bar_zero_or_lost"
-                if nb["dots_gained"] <= 0
-                else "narrow_bar_below_min_dots"
-            )
-            ref = _element_ref(nb, "bar", reason)
-            failed_elements.setdefault((ref["run_index"], "bar"), ref)
-        if ns is not None and ns["dots_gained"] <= 0:
-            ref = _element_ref(ns, "space", "space_closed_by_gain")
-            failed_elements.setdefault((ref["run_index"], "space"), ref)
+        # 收集该工况下全部失效条/空（不止最窄的一个）；同元素在更严苛
+        # 工况（增益后点数更小）再次出现时覆盖为更差快照
+        for r in gained:
+            key = (r["run_index"], "bar" if r["is_bar"] else "space")
+            if r["is_bar"]:
+                if r["dots_gained"] < req:
+                    reason = (
+                        "narrow_bar_zero_or_lost"
+                        if r["dots_gained"] <= 0
+                        else "narrow_bar_below_min_dots"
+                    )
+                    ref = _element_ref(r, "bar", reason)
+                    old = failed_elements.get(key)
+                    if old is None or ref["width_dots_under_gain"] < old[
+                        "width_dots_under_gain"
+                    ]:
+                        failed_elements[key] = ref
+            elif _is_inner_space(r, modules) and r["dots_gained"] <= 0:
+                ref = _element_ref(r, "space", "space_closed_by_gain")
+                old = failed_elements.get(key)
+                if old is None or ref["width_dots_under_gain"] < old[
+                    "width_dots_under_gain"
+                ]:
+                    failed_elements[key] = ref
 
         nb_dots = nb["dots_gained"]
         rec_bar.append(
@@ -612,6 +625,54 @@ def _printer_scale_range(
             num_q = lim - (grow_hi + qz_req) * along - (hhalf + qz_req) * across
             uppers.append(
                 bnd("upper", max(0.0, num_q) / denom, f"quiet_zone_{side}")
+            )
+
+    # 禁区碰撞：缩放后的实体（含正增益外延、最不利偏移端点）必须离开每个
+    # 裁切禁区。沿 4 条 SAT 轴（实体边法向 2 条 + 标签/禁区 AABB 边 2 条）
+    # 的分离条件关于 s 为线性，逐“禁区 × 偏移组合”求可分离的临界 s，
+    # 再取最保守上界；任何 s>0 都分离不了（如禁区覆盖整标签）时上界为 0，
+    # 区间即不可行。每条轴携带 (轴向量, 宽度方向系数, 高度方向系数)。
+    if layout.forbidden_zones:
+        rad = math.radians(box.rotation_deg)
+        ca, sa = abs(math.cos(rad)), abs(math.sin(rad))
+        # 每条轴：(法向量, 条码宽度方向投影系数, 条码高度方向投影系数)
+        # 实体自身边法向：局部 x/y 轴；其余两条为禁区 AABB 边法向（世界轴）
+        axes = [
+            ((ca, sa), 1.0, 0.0),     # 沿条码宽度方向的边法向
+            ((sa, ca), 0.0, 1.0),     # 沿条码高度方向的边法向（宽度缩放无效）
+            ((1.0, 0.0), ca, sa),     # 禁区水平边法向
+            ((0.0, 1.0), sa, ca),     # 禁区垂直边法向
+        ]
+        for z in layout.forbidden_zones:
+            zcx = z.x_mm + z.width_mm / 2
+            zcy = z.y_mm + z.height_mm / 2
+            combo_bounds = []
+            for ox in (ox_lo, ox_hi):
+                for oy in (oy_lo, oy_hi):
+                    dx = cx + ox - zcx
+                    dy = cy + oy - zcy
+                    best = -math.inf
+                    for (ax, ay), kw, kh in axes:
+                        denom = w2 * kw
+                        if denom <= 1e-12:
+                            continue
+                        # |d·n| > (w*s/2 + grow)*kw + h2*kh + 禁区半幅
+                        zone_half = (
+                            z.width_mm / 2 * ax + z.height_mm / 2 * ay
+                        )
+                        proj = abs(dx * ax + dy * ay)
+                        bound = (
+                            proj - zone_half - grow_hi * kw - h2 * kh
+                        ) / denom
+                        best = max(best, bound)
+                    combo_bounds.append(best)
+            zone_upper = min(combo_bounds)
+            uppers.append(
+                bnd(
+                    "upper",
+                    max(0.0, zone_upper),
+                    f"forbidden_zone_{z.id or 'zone'}",
+                )
             )
 
     s_min = max(b["value"] for b in lowers)

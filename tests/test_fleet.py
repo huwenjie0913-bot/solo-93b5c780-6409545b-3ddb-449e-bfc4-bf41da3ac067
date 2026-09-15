@@ -129,6 +129,97 @@ def test_gain_extreme_closes_space_and_lists_failed_element():
     assert p["scale_range"]["min"] > 1.0
 
 
+def test_regression_all_closed_inner_spaces_collected():
+    """复核缺陷 1：16mm Code 128 在 +2 点增益下闭合 12 个内部空，
+    failed_elements 必须全部返回，不能只报 run_index 1。"""
+    narrow = layout(barcode={
+        "symbology": "code128",
+        "data": "ABC123",
+        "box": {"x_mm": 20, "y_mm": 10, "width_mm": 16, "height_mm": 20},
+    })
+    p203 = printer("P203", 203, ox=(0.0, 0.0), oy=(0.0, 0.0), gain=(0, 2))
+    r = post([p203], [narrow])
+    p = r.json()["results"][0]["printers"][0]
+
+    closed = [f for f in p["failed_elements"] if f["type"] == "space"]
+    assert len(closed) == 12, [f["run_index"] for f in closed]
+    # 不能只列最窄的 run_index 1
+    assert sorted(f["run_index"] for f in closed) == [
+        1, 7, 15, 23, 29, 35, 39, 41, 45, 47, 51, 53
+    ]
+    # 每个失效元素都可定位，并保留名义/增益后点数
+    for fe in closed:
+        assert fe["failure_reason"] == "space_closed_by_gain"
+        assert fe["width_dots_nominal"] > 0
+        assert fe["width_dots_under_gain"] <= 0
+        assert fe["start_module"] >= 0
+        assert fe["width_modules"] >= 1
+    # run_index 去重（同一元素在多工况下只汇总为一条最严快照）
+    run_indices = [f["run_index"] for f in p["failed_elements"]]
+    assert len(run_indices) == len(set(run_indices))
+
+
+def test_regression_forbidden_zone_covers_label_makes_range_infeasible():
+    """复核缺陷 2：禁区覆盖整张标签、forbidden_zone 为 fail 时，
+    单机型区间与共同区间都必须 feasible=false（上界 0）。"""
+    full_zone = [{"id": "full", "x_mm": 0, "y_mm": 0,
+                  "width_mm": 100, "height_mm": 60}]
+    lay = layout(forbidden_zones=full_zone)
+    r = post([P203, P300], [lay])
+    res = r.json()["results"][0]
+
+    for p in res["printers"]:
+        fz = next(c for c in p["checks"] if c["check"] == "forbidden_zone")
+        assert fz["worst_status"] == "fail"
+        sr = p["scale_range"]
+        assert sr["feasible"] is False, p["printer_id"]
+        assert sr["max"] == 0.0
+        assert sr["min"] > sr["max"]
+        # 上界里必须包含来自禁区的约束
+        fz_bounds = [
+            b for b in sr["bounds"]["upper"]
+            if b["constraint"].startswith("forbidden_zone_")
+        ]
+        assert fz_bounds and fz_bounds[0]["value"] == 0.0
+
+    csr = res["common_scale_range"]
+    assert csr["feasible"] is False
+    assert csr["max"] == 0.0
+    # 冲突清单必须点出禁区上界及其来源机型
+    fz_conflicts = [c for c in csr["conflicts"]
+                    if c["kind"] == "upper"
+                    and c["constraint"].startswith("forbidden_zone_")]
+    assert {c["printer_id"] for c in fz_conflicts} == {"P203", "P300"}
+    assert res["status"] == "fail"
+
+
+def test_regression_partial_forbidden_zone_tightens_range_but_escape_exists():
+    """复核缺陷 2 的对照面：实体可通过缩小逃离禁区时，禁区上界为正且
+    与真实多边形相交判定一致，不应一刀切报 0。"""
+    # 禁区贴在名义条码右缘外侧；缩小后实体离开禁区（静区设 0，排除静区 warn）
+    lay = layout(
+        quiet_zone_mm=0,
+        forbidden_zones=[
+            {"id": "cut", "x_mm": 71, "y_mm": 10, "width_mm": 10, "height_mm": 20}
+        ],
+    )
+    p = printer("Z203", 203, ox=(0.0, 0.0), oy=(0.0, 0.0), gain=(0, 0))
+    r = post([p], [lay])
+    pr = r.json()["results"][0]["printers"][0]
+    sr = pr["scale_range"]
+    fz_bound = next(b for b in sr["bounds"]["upper"]
+                    if b["constraint"] == "forbidden_zone_cut")
+    # 名义尺寸（s=1）下实体不碰禁区（x 到 70mm，禁区从 71mm 起）
+    fz_check = next(c for c in pr["checks"] if c["check"] == "forbidden_zone")
+    assert fz_check["worst_status"] == "pass"
+    # 几何检查基于条码框名义宽，上界为正且紧邻 s=1
+    assert 0.0 < fz_bound["value"]
+    assert abs(fz_bound["value"] - 1.0) < 0.1
+    # 禁区完全在远处时不应把区间压到不可行
+    assert sr["feasible"] is True
+
+
+
 def test_offset_extreme_triggers_out_of_bounds():
     # 条码贴右缘放置；向右偏移 5mm 的端点必然越界
     tight = layout(barcode={
