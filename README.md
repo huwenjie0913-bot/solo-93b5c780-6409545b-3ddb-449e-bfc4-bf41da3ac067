@@ -8,10 +8,56 @@
 ```bash
 pip install -r requirements.txt
 uvicorn app.main:app --port 8000
-pytest tests/          # 10 个用例
+pytest tests/          # 24 个用例
 ```
 
 ## 接口
+
+### `POST /v1/fleet-compatibility`
+
+同一批毫米版式下发到不同仓库的多台热敏打印机（如 203 / 300 DPI），
+逐机型枚举**公差端点工况**并重新点阵化：横/纵向套准偏差各取 min/max 端点，
+条纹增益（整数点，正为墨点增粗、负为收窄）取 min/max 端点，共 2³=8 种组合。
+
+```json
+{
+  "label": {"width_mm": 100, "height_mm": 60},
+  "printers": [{
+    "printer_id": "WH-A-203",
+    "dpi": 203,
+    "offset_x_mm": {"min_mm": -1.5, "max_mm": 1.5},
+    "offset_y_mm": {"min_mm": -1.0, "max_mm": 1.0},
+    "gain_dots":   {"min_dots": -1, "max_dots": 1}
+  }, {
+    "printer_id": "WH-B-300",
+    "dpi": 300,
+    "offset_x_mm": {"min_mm": -0.8, "max_mm": 0.8},
+    "offset_y_mm": {"min_mm": -0.8, "max_mm": 0.8},
+    "gain_dots":   {"min_dots": 0, "max_dots": 1}
+  }],
+  "layouts": [ /* 与 /v1/preflight 相同的 LayoutSpec 列表，ID 唯一 */ ]
+}
+```
+
+每“套版式 × 机型”返回：
+
+- **status / worst_status / worst_margin**：8 种工况中的最差状态与归一化裕量
+- **trigger_condition**：触发最差状态的端点工况（offset_x_mm / offset_y_mm / gain_dots）
+- **checks**：`narrowest_bar` / `narrowest_space` / `quiet_zone` /
+  `out_of_bounds` / `forbidden_zone` / `text_collision`，各带最差工况、
+  归一化裕量与物理裕量（`margin_mm`，毫米）和可定位元素
+- **failed_elements**：被最差增益吃掉的条/空（`space_closed_by_gain` /
+  `narrow_bar_below_min_dots` / `narrow_bar_zero_or_lost`），含名义点数与
+  增益后点数、游程序号与模块偏移
+- **scale_range**：该机型上的可行缩放区间及全部上下界（带来源约束名）
+
+每套版式还返回 **common_scale_range** —— 全部机型缩放区间的交集：
+区间为空时 `conflicts` 列出相互冲突的最大下界 / 最小上界及其机型（printer_id、
+DPI、约束名）；某机型连名义点阵化都排不进框时以 `blocked_by` 指明该机型。
+
+单套版式无法编码（UNENCODABLE_DATA）或某机型 CANNOT_FIT 均为**行内 error**，
+不中断其余版式 × 机型组合。结果排序与 `/v1/preflight` 一致：错误版式最前，
+其后按跨机型最差裕量升序。
 
 ### `POST /v1/preflight`
 
@@ -54,11 +100,12 @@ pytest tests/          # 10 个用例
 
 | 场景 | 位置 | code | HTTP |
 |---|---|---|---|
-| 参数问题（尺寸非正、字段缺失等） | 请求级 | `INVALID_PARAMETERS` | 422 |
+| 参数问题（尺寸非正、字段缺失、档案/版式 ID 重复、偏差范围反向等） | 请求级 | `INVALID_PARAMETERS` | 422 |
 | 不可编码数据（非法字符、EAN-13 校验位错） | 版式级 | `UNENCODABLE_DATA` | 行内 error |
-| 无法排入给定框（每模块 1 点也超宽） | 版式级 | `CANNOT_FIT` | 行内 error |
+| 无法排入给定框（每模块 1 点也超宽） | 版式级（fleet 中为机型级） | `CANNOT_FIT` | 行内 error |
 
-批量提交时单套版式的数据问题不中断整批，以行内 `error` 返回。
+批量提交时单套版式的数据问题不中断整批，以行内 `error` 返回；
+`/v1/fleet-compatibility` 中 CANNOT_FIT 只标记对应机型，其余机型照常评估。
 
 ## 实现要点
 
@@ -68,3 +115,9 @@ pytest tests/          # 10 个用例
 - 禁区/文字碰撞按旋转后的真实条码实体做分离轴（SAT）精确相交判定，不用 AABB 近似
 - 预览缩略（超大标签降像素）时背景、目标框、条纹共用同一缩放比例
 - 建议缩放区间同时受最窄条点数、框宽、静区富余、旋转包围盒边界四类约束
+- 机队分析枚举 8 种公差端点组合逐机型重新点阵化；套准偏移只平移实体（不旋转），
+  正增益让条纹两端各外延 g 个打印点，几何检查（越界/静区/禁区）均在该外延后的
+  真实旋转矩形上做 SAT 判定
+- 机型缩放上下界按最不利端点解析推导：下界取收窄端的最窄条、增粗端的最窄空；
+  上界取框宽（含增益外延）与四个偏移端点中最近的标签边/静区留界；
+  共同区间为空时给出顶起下界与压住上界的具体机型与约束
